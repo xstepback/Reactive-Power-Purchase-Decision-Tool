@@ -84,11 +84,40 @@ def load_case(csv_file):
     Returns: DataFrame with exactly 48 hours, with hour labels 0..47
     If only 24h, duplicate to 48h for display (but label clearly).
     """
-    # Handle both file paths and file-like objects
+    # Handle both file paths and file-like objects with encoding fallback
     if isinstance(csv_file, (str, Path)):
-        df = pd.read_csv(csv_file)
+        # Try different encodings
+        encodings = ['utf-8', 'cp1254', 'latin1']
+        df = None
+        last_error = None
+        for encoding in encodings:
+            try:
+                df = pd.read_csv(csv_file, encoding=encoding)
+                break
+            except (UnicodeDecodeError, UnicodeError) as e:
+                last_error = e
+                continue
+        if df is None:
+            # Last resort: try with error handling
+            df = pd.read_csv(csv_file, encoding='utf-8', errors='ignore')
     else:
-        df = pd.read_csv(csv_file)
+        # File-like object - try to read with encoding fallback
+        csv_file.seek(0)
+        content = csv_file.read()
+        if isinstance(content, bytes):
+            encodings = ['utf-8', 'cp1254', 'latin1']
+            for encoding in encodings:
+                try:
+                    content = content.decode(encoding)
+                    break
+                except (UnicodeDecodeError, UnicodeError):
+                    continue
+            else:
+                content = content.decode("utf-8", errors='ignore')
+            df = pd.read_csv(io.StringIO(content))
+        else:
+            csv_file.seek(0)
+            df = pd.read_csv(csv_file)
     df = df.sort_values("hour").reset_index(drop=True)
     
     required_cols = ['hour', 'P_total', 'Q_total', 'P_PV_max']
@@ -116,6 +145,27 @@ def load_case(csv_file):
     return df
 
 
+def _read_file_with_encoding_fallback(file_path):
+    """
+    Helper function to read a file with encoding fallback.
+    Tries utf-8, then cp1254 (Turkish Windows), then latin1.
+    Returns: content as string
+    """
+    encodings = ['utf-8', 'cp1254', 'latin1']
+    last_error = None
+    
+    for encoding in encodings:
+        try:
+            with open(file_path, "r", encoding=encoding) as f:
+                return f.read()
+        except (UnicodeDecodeError, UnicodeError) as e:
+            last_error = e
+            continue
+    
+    # If all encodings fail, raise the last error
+    raise ValueError(f"Could not decode file with any encoding. Last error: {last_error}")
+
+
 def load_prices(csv_file):
     """
     Load price CSV - accepts EPİAŞ format or simple (hour, price_TL_per_MWh)
@@ -128,15 +178,29 @@ def load_prices(csv_file):
     content = None
     
     if is_file_path:
-        # File path - read directly
-        with open(csv_file, "r", encoding="utf-8") as f:
-            lines = f.readlines()
+        # File path - read with encoding fallback
+        try:
+            content = _read_file_with_encoding_fallback(csv_file)
+            lines = content.splitlines()
+        except Exception as e:
+            # Fallback to utf-8 directly
+            with open(csv_file, "r", encoding="utf-8") as f:
+                lines = f.readlines()
     else:
         # File-like object
         csv_file.seek(0)
         content = csv_file.read()
         if isinstance(content, bytes):
-            content = content.decode("utf-8")
+            # Try to decode with fallback encodings
+            encodings = ['utf-8', 'cp1254', 'latin1']
+            for encoding in encodings:
+                try:
+                    content = content.decode(encoding)
+                    break
+                except (UnicodeDecodeError, UnicodeError):
+                    continue
+            else:
+                content = content.decode("utf-8", errors='ignore')  # Last resort
         lines = content.splitlines()
     
     reader = csv.reader(lines)
@@ -199,6 +263,188 @@ def load_prices(csv_file):
     if len(prices) > 48:
         prices = prices[-48:]
         st.info(f"⚠️ Price file has {len(prices)} hours. Using latest 48 hours only.")
+    
+    return prices
+
+
+# =========================================================
+# A.1) Multi-Day File Loading Functions
+# =========================================================
+
+def load_case_multiday(csv_file, horizon_days):
+    """
+    Load Norwegian_case CSV with columns: hour, P_total, Q_total, P_PV_max
+    For multi-day horizon: returns DataFrame with 24*horizon_days hours.
+    Accepts either a file path (string/Path) or file-like object.
+    Returns: DataFrame with hour index 0..(24*horizon_days-1)
+    If only 24h, tiles to fill horizon. If more hours, takes latest horizon_days*24.
+    """
+    # Handle both file paths and file-like objects with encoding fallback
+    if isinstance(csv_file, (str, Path)):
+        # Try different encodings
+        encodings = ['utf-8', 'cp1254', 'latin1']
+        df = None
+        for encoding in encodings:
+            try:
+                df = pd.read_csv(csv_file, encoding=encoding)
+                break
+            except (UnicodeDecodeError, UnicodeError):
+                continue
+        if df is None:
+            df = pd.read_csv(csv_file, encoding='utf-8', errors='ignore')
+    else:
+        # File-like object
+        csv_file.seek(0)
+        content = csv_file.read()
+        if isinstance(content, bytes):
+            encodings = ['utf-8', 'cp1254', 'latin1']
+            for encoding in encodings:
+                try:
+                    content = content.decode(encoding)
+                    break
+                except (UnicodeDecodeError, UnicodeError):
+                    continue
+            else:
+                content = content.decode("utf-8", errors='ignore')
+            df = pd.read_csv(io.StringIO(content))
+        else:
+            csv_file.seek(0)
+            df = pd.read_csv(csv_file)
+    
+    df = df.sort_values("hour").reset_index(drop=True)
+    
+    required_cols = ['hour', 'P_total', 'Q_total', 'P_PV_max']
+    for col in required_cols:
+        if col not in df.columns:
+            raise ValueError(f"Missing required column: {col}")
+    
+    n_rows = len(df)
+    target_hours = 24 * horizon_days
+    
+    # If only 24h, tile to fill horizon
+    if n_rows == 24:
+        tiles_needed = horizon_days
+        df_list = [df.copy()]
+        for i in range(1, tiles_needed):
+            df_tile = df.copy()
+            df_tile['hour'] = df_tile['hour'] + (i * 24)
+            df_list.append(df_tile)
+        df = pd.concat(df_list, ignore_index=True)
+        st.info(f"⚠️ Case file has 24 hours. Tiled {horizon_days} times to fill {horizon_days}-day horizon.")
+    
+    # If more than needed, take latest target_hours
+    if len(df) > target_hours:
+        df = df.tail(target_hours).reset_index(drop=True)
+        st.info(f"⚠️ Case file has {n_rows} hours. Showing latest {target_hours} hours ({horizon_days} days).")
+    
+    # Ensure hour labels are 0..(target_hours-1) for consistency
+    df['hour'] = np.arange(target_hours)
+    
+    return df
+
+
+def load_prices_multiday(csv_file, horizon_days):
+    """
+    Load price CSV for multi-day horizon - accepts EPİAŞ format or simple format.
+    Accepts either a file path (string/Path) or file-like object.
+    Returns: numpy array of prices in TL/MWh, length 24*horizon_days
+    If only 24 prices, tiles to fill horizon. If more, takes latest horizon_days*24.
+    """
+    # Handle both file paths and file-like objects
+    is_file_path = isinstance(csv_file, (str, Path))
+    content = None
+    
+    if is_file_path:
+        # File path - read with encoding fallback
+        try:
+            content = _read_file_with_encoding_fallback(csv_file)
+            lines = content.splitlines()
+        except Exception:
+            with open(csv_file, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+    else:
+        # File-like object
+        csv_file.seek(0)
+        content = csv_file.read()
+        if isinstance(content, bytes):
+            encodings = ['utf-8', 'cp1254', 'latin1']
+            for encoding in encodings:
+                try:
+                    content = content.decode(encoding)
+                    break
+                except (UnicodeDecodeError, UnicodeError):
+                    continue
+            else:
+                content = content.decode("utf-8", errors='ignore')
+        lines = content.splitlines()
+    
+    reader = csv.reader(lines)
+    header = next(reader, None)
+    
+    prices = []
+    
+    # Try EPİAŞ format first (Tarih, Saat, PTF (TL/MWh), ...)
+    if header and len(header) >= 3 and "PTF" in header[2]:
+        # EPİAŞ format: parse price from row like ["20.11.2025", "00:00", "2.517", "01", ...]
+        for row in reader:
+            if not row or len(row) < 4:
+                continue
+            try:
+                price_str = row[2].strip() + "," + row[3].strip()
+                price_str_norm = price_str.replace(".", "").replace(",", ".")
+                price = float(price_str_norm)
+                prices.append(price)
+            except (ValueError, IndexError):
+                continue
+    else:
+        # Simple format: try to find hour and price columns
+        if is_file_path:
+            # Try encodings
+            encodings = ['utf-8', 'cp1254', 'latin1']
+            df = None
+            for encoding in encodings:
+                try:
+                    df = pd.read_csv(csv_file, encoding=encoding)
+                    break
+                except (UnicodeDecodeError, UnicodeError):
+                    continue
+            if df is None:
+                df = pd.read_csv(csv_file, encoding='utf-8', errors='ignore')
+        else:
+            csv_file.seek(0)
+            if content:
+                df = pd.read_csv(io.StringIO(content))
+            else:
+                csv_file.seek(0)
+                df = pd.read_csv(csv_file)
+        
+        # Look for price column
+        price_col = None
+        for col in df.columns:
+            if 'price' in col.lower() or 'ptf' in col.lower() or 'tl' in col.lower():
+                price_col = col
+                break
+        
+        if price_col is None:
+            if len(df.columns) >= 2:
+                price_col = df.columns[1]
+            else:
+                raise ValueError("Could not find price column in CSV")
+        
+        prices = df[price_col].values.tolist()
+    
+    prices = np.array(prices, dtype=float)
+    target_length = 24 * horizon_days
+    
+    # If only 24 prices, tile to fill horizon
+    if len(prices) == 24:
+        prices = np.tile(prices, horizon_days)
+        st.info(f"⚠️ Price file has 24 hours. Tiled {horizon_days} times to fill {horizon_days}-day horizon.")
+    
+    # If more than needed, take latest target_length
+    if len(prices) > target_length:
+        prices = prices[-target_length:]
+        st.info(f"⚠️ Price file has {len(prices)} hours. Using latest {target_length} hours ({horizon_days} days).")
     
     return prices
 
@@ -789,6 +1035,271 @@ def simulate_two_days(df_case, prices, S_rated, pf_limit, strategy, backlog_prev
 
 
 # =========================================================
+# D.1) Multi-Day Simulation
+# =========================================================
+
+def simulate_multi_days(df_case_N, prices_N, S_rated, pf_limit, strategy, backlog_prev_total,
+                        alpha=0.10, penalty_rate=200.0):
+    """
+    Simulate multi-day horizon (7/14/30 days) with backlog logic.
+    Reuses the SAME per-day logic from simulate_two_days.
+    
+    Core logic (per day d):
+    - Day 1: compute Q_limit, Q_need_base, Q_avail; deliver Q_inv = min(Q_need, Q_avail); 
+      Q_deficit = Q_need - Q_inv; backlog_total = sum(Q_deficit)
+    - For day d>=2:
+      - compute day's base need (from PF rule): Q_need_base_d = max(Q_total - Q_limit, 0)
+      - compute freecap_d = max(Q_avail_d - Q_need_base_d, 0)
+      - allocate previous day's backlog_total into today using SAME strategy functions
+      - total request: Q_need_total_d = Q_need_base_d + A_alloc_d
+      - deliver: Q_inv_d = min(Q_need_total_d, Q_avail_d)
+      - deficit: Q_deficit_d = Q_need_total_d - Q_inv_d
+      - backlog_total_for_next_day = sum(Q_deficit_d)
+    
+    Args:
+        df_case_N: DataFrame with 24*horizon_days rows, columns: hour, P_total, Q_total, P_PV_max
+        prices_N: array with 24*horizon_days prices
+        S_rated: rated apparent power (MVA)
+        pf_limit: power factor limit
+        strategy: backlog allocation strategy ("uniform", "price_weighted", "price_feasible", "economic_feasible")
+        backlog_prev_total: backlog from previous simulation (scalar)
+        alpha: reactive price multiplier (for economic strategy)
+        penalty_rate: penalty rate in TL/MVArh (for economic strategy)
+    
+    Returns:
+        results_df_N: DataFrame with all hours, columns: hour, day_index, hour_in_day, P, Q_D, P_PV_max, price,
+                     Q_limit, Q_need, Q_avail, Q_inv, Q_deficit, Q_need_base, A_alloc, Q_need_total
+        daily_summary_df: DataFrame with one row per day: day, backlog_in, backlog_allocated, backlog_cleared,
+                         backlog_out, new_need_sum, delivered_sum
+        cohort_df: DataFrame tracking deficit by origin day at end of day 7 (if horizon>=7):
+                  origin_day, remaining_amount
+    """
+    horizon_days = len(df_case_N) // 24
+    hours = df_case_N['hour'].values
+    P = df_case_N['P_total'].values
+    Q_D = df_case_N['Q_total'].values
+    P_PV_max = df_case_N['P_PV_max'].values
+    
+    # Ensure prices are correct length
+    if len(prices_N) < len(df_case_N):
+        # Tile if needed
+        tiles_needed = (len(df_case_N) + len(prices_N) - 1) // len(prices_N)
+        prices_N = np.tile(prices_N, tiles_needed)[:len(df_case_N)]
+    elif len(prices_N) > len(df_case_N):
+        prices_N = prices_N[:len(df_case_N)]
+    
+    # Initialize result arrays (one per hour)
+    Q_limit = np.zeros(len(df_case_N), dtype=float)
+    Q_need_base = np.zeros(len(df_case_N), dtype=float)  # Base need from PF rule
+    Q_avail = np.zeros(len(df_case_N), dtype=float)
+    Q_inv = np.zeros(len(df_case_N), dtype=float)
+    Q_deficit = np.zeros(len(df_case_N), dtype=float)
+    A_alloc = np.zeros(len(df_case_N), dtype=float)  # Backlog allocation
+    Q_need_total = np.zeros(len(df_case_N), dtype=float)  # Total request (base + allocation)
+    
+    # Daily summary tracking
+    daily_summary = []
+    
+    # Cohort tracking: track deficit by origin day (FIFO clearing)
+    # cohort[origin_day] = remaining amount from that day
+    cohort = {}  # Will track by origin day index (1-indexed)
+    # We'll track how much backlog was cleared each day to update cohorts
+    
+    # Track backlog cleared per day for cohort updates
+    backlog_cleared_per_day = {}  # day -> amount cleared that day
+    
+    # Current backlog (carries over day by day)
+    current_backlog_total = float(backlog_prev_total)
+    if current_backlog_total > 1e-6:
+        # Initialize cohort for previous backlog (assign to "day 0")
+        cohort[0] = current_backlog_total
+    
+    # =========================================================
+    # DAY-BY-DAY SIMULATION
+    # =========================================================
+    for day_idx in range(horizon_days):
+        day_num = day_idx + 1  # 1-indexed day number
+        
+        # Get hours for this day
+        day_start_hour = day_idx * 24
+        day_end_hour = (day_idx + 1) * 24
+        day_mask = (hours >= day_start_hour) & (hours < day_end_hour)
+        day_indices = np.where(day_mask)[0]
+        
+        # Extract day data
+        P_day = P[day_mask]
+        Q_D_day = Q_D[day_mask]
+        P_PV_max_day = P_PV_max[day_mask]
+        prices_day = prices_N[day_mask]
+        
+        # Compute base quantities for this day
+        Q_limit_day = compute_q_limit(P_day, pf_limit)
+        Q_need_base_day = compute_q_need(Q_D_day, Q_limit_day)
+        Q_avail_day = compute_q_avail(S_rated, P_PV_max_day)
+        
+        # Store base quantities
+        Q_limit[day_indices] = Q_limit_day
+        Q_need_base[day_indices] = Q_need_base_day
+        Q_avail[day_indices] = Q_avail_day
+        
+        # Track backlog allocation for this day
+        backlog_allocated_day = 0.0
+        backlog_cleared_day = 0.0
+        
+        if day_idx == 0:
+            # Day 1: no backlog allocation, just base need
+            Q_need_total_day = Q_need_base_day.copy()
+            A_alloc_day = np.zeros(24, dtype=float)
+        else:
+            # Day 2+: allocate backlog from previous day
+            # Step 1: Compute free capacity for backlog
+            freecap_day = np.maximum(Q_avail_day - Q_need_base_day, 0)
+            
+            # Step 2: Generate raw allocation proposal using chosen strategy
+            A_alloc_raw = None
+            if strategy == "uniform":
+                A_alloc_raw = allocate_backlog_uniform(current_backlog_total, n_hours=24)
+            elif strategy == "price_weighted":
+                A_alloc_raw = allocate_backlog_price_weighted(current_backlog_total, prices_day)
+            elif strategy == "price_feasible":
+                A_alloc_raw = allocate_backlog_price_weighted(current_backlog_total, prices_day)
+            elif strategy == "economic_feasible":
+                A_alloc_raw = np.zeros(24, dtype=float)
+            else:
+                raise ValueError(f"Unknown strategy: {strategy}")
+            
+            # Step 3: Apply capacity-aware reallocation
+            if strategy == "economic_feasible":
+                A_alloc_day, economic_info_day = allocate_backlog_economic_feasible(
+                    current_backlog_total, Q_need_base_day, Q_avail_day, prices_day,
+                    alpha, penalty_rate
+                )
+            else:
+                # Apply capacity-aware reallocation for uniform, price_weighted, price_feasible
+                A_alloc_day, leftover_unallocated = apply_capacity_aware_reallocation(
+                    A_alloc_raw, current_backlog_total, freecap_day, prices_day, strategy,
+                    None, None
+                )
+            
+            # Total allocation amount
+            backlog_allocated_day = np.sum(A_alloc_day)
+            
+            # Total request = base need + backlog allocation
+            Q_need_total_day = Q_need_base_day + A_alloc_day
+        
+        # Market delivers Q_inv (limited by Q_avail)
+        Q_inv_day = np.minimum(Q_need_total_day, Q_avail_day)
+        
+        # Compute backlog cleared (actually realized backlog allocation)
+        # This is the portion of A_alloc that was actually delivered
+        backlog_cleared_day = np.sum(np.maximum(Q_inv_day - Q_need_base_day, 0))
+        
+        # Any unmet part becomes Q_deficit
+        Q_deficit_day = Q_need_total_day - Q_inv_day
+        
+        # Store results for this day
+        Q_inv[day_indices] = Q_inv_day
+        Q_deficit[day_indices] = Q_deficit_day
+        A_alloc[day_indices] = A_alloc_day if day_idx > 0 else np.zeros(24)
+        Q_need_total[day_indices] = Q_need_total_day
+        
+        # Update backlog for next day
+        # For day 1: backlog_in is the previous backlog (backlog_prev_total)
+        # For day 2+: backlog_in is the current_backlog_total (which is backlog_out from previous day)
+        if day_idx == 0:
+            backlog_in = float(backlog_prev_total)
+        else:
+            backlog_in = current_backlog_total
+        
+        backlog_out = np.sum(Q_deficit_day)
+        current_backlog_total = backlog_out
+        
+        # Update cohorts using FIFO rule: when backlog is cleared, consume oldest cohorts first
+        if day_idx > 0 and backlog_cleared_day > 1e-6:
+            remaining_to_clear = backlog_cleared_day
+            # Sort cohort keys (origin days) to process oldest first (including day 0 for previous backlog)
+            sorted_origin_days = sorted(cohort.keys())
+            for origin_day in sorted_origin_days:
+                if remaining_to_clear <= 1e-9:
+                    break
+                if cohort[origin_day] > 1e-9:
+                    amount_to_clear_from_origin = min(remaining_to_clear, cohort[origin_day])
+                    cohort[origin_day] -= amount_to_clear_from_origin
+                    remaining_to_clear -= amount_to_clear_from_origin
+                    if cohort[origin_day] < 1e-9:
+                        cohort[origin_day] = 0.0
+        
+        # Add new deficit from this day to cohort (after clearing previous backlog)
+        if backlog_out > 1e-6:
+            if day_num not in cohort:
+                cohort[day_num] = 0.0
+            cohort[day_num] += backlog_out
+        else:
+            # Ensure cohort entry exists even if zero (for consistency)
+            if day_num not in cohort:
+                cohort[day_num] = 0.0
+        
+        # Store backlog cleared for this day
+        backlog_cleared_per_day[day_num] = backlog_cleared_day
+        
+        # Daily summary
+        # backlog_in is already correctly set above based on day_idx
+        daily_summary.append({
+            'day': day_num,
+            'backlog_in': backlog_in,
+            'backlog_allocated': backlog_allocated_day,
+            'backlog_cleared': backlog_cleared_day,
+            'backlog_out': backlog_out,
+            'new_need_sum': np.sum(Q_need_base_day),
+            'delivered_sum': np.sum(Q_inv_day)
+        })
+    
+    # Build results DataFrame
+    # Note: Q_need represents total request (base + allocation), same as Q_need_total
+    # We include both for consistency with 48h path, but they are identical
+    results_df_N = pd.DataFrame({
+        'hour': hours,
+        'day_index': (hours // 24).astype(int),
+        'hour_in_day': (hours % 24).astype(int),
+        'P': P,
+        'Q_D': Q_D,
+        'P_PV_max': P_PV_max,
+        'price': prices_N,
+        'Q_limit': Q_limit,
+        'Q_need': Q_need_total,  # Total request (base + allocation)
+        'Q_avail': Q_avail,
+        'Q_inv': Q_inv,
+        'Q_deficit': Q_deficit,
+        'Q_need_base': Q_need_base,  # Base need from PF rule
+        'A_alloc': A_alloc,  # Backlog allocation
+        'Q_need_total': Q_need_total,  # Same as Q_need (for consistency with 48h)
+    })
+    
+    # Build daily summary DataFrame
+    daily_summary_df = pd.DataFrame(daily_summary)
+    
+    # Build cohort DataFrame (at end of day 7, if horizon >= 7)
+    cohort_df = None
+    if horizon_days >= 7:
+        # Filter cohorts to origin days 1..7
+        cohort_list = []
+        for origin_day in range(1, 8):  # Days 1-7
+            remaining = cohort.get(origin_day, 0.0)
+            if remaining > 1e-9:
+                cohort_list.append({
+                    'origin_day': origin_day,
+                    'remaining_amount': remaining
+                })
+        if cohort_list:
+            cohort_df = pd.DataFrame(cohort_list)
+        else:
+            # Empty cohort (all cleared)
+            cohort_df = pd.DataFrame(columns=['origin_day', 'remaining_amount'])
+    
+    return results_df_N, daily_summary_df, cohort_df
+
+
+# =========================================================
 # E) Plotting Functions
 # =========================================================
 
@@ -957,6 +1468,276 @@ def plot_strategy_allocation(results_df, reallocation_info, strategy):
     return fig
 
 
+def plot_multi_day_timeline(results_df_N, selected_day=None, show_full_horizon=True):
+    """
+    Multi-day stacked bar visualization showing REALIZED allocation.
+    Similar to plot_48hour_timeline but for multi-day horizons.
+    
+    Args:
+        results_df_N: DataFrame with all hours for the horizon
+        selected_day: If provided, filter to this day only (1-indexed). If None and show_full_horizon=False, use day 1.
+        show_full_horizon: If True, plot all days. If False and selected_day is provided, plot only that day.
+    
+    Returns:
+        fig: Plotly figure
+    """
+    # Filter to selected day if specified
+    if selected_day is not None and not show_full_horizon:
+        plot_df = results_df_N[results_df_N['day_index'] == (selected_day - 1)].copy()
+        title_suffix = f" (Day {selected_day} only)"
+    else:
+        plot_df = results_df_N.copy()
+        if selected_day is not None:
+            title_suffix = f" (Full horizon, Day {selected_day} highlighted)"
+        else:
+            title_suffix = " (Full horizon)"
+    
+    fig = go.Figure()
+    
+    # Get base_Q_need (Q_need before backlog allocation)
+    # For Day 1: base_Q_need = Q_need (since A_alloc = 0)
+    # For Day 2+: base_Q_need = Q_need_base
+    base_Q_need = plot_df['Q_need_base'].values.copy()
+    day1_mask = plot_df['day_index'] == 0
+    base_Q_need[day1_mask] = plot_df.loc[day1_mask, 'Q_need'].values
+    
+    # Compute backlog_cleared (actually realized backlog)
+    Q_inv = plot_df['Q_inv'].values
+    A_alloc = plot_df['A_alloc'].values
+    backlog_cleared = np.maximum(Q_inv - base_Q_need, 0)
+    backlog_cleared = np.minimum(backlog_cleared, A_alloc)
+    
+    # Compute Q_inv_base (part that serves base_Q_need)
+    Q_inv_base = Q_inv - backlog_cleared
+    
+    # Stacked bars (bottom to top):
+    # Bottom: Q_inv_base (delivered to serve base need)
+    fig.add_trace(go.Bar(
+        x=plot_df['hour'],
+        y=Q_inv_base,
+        name='Q_inv (delivered)',
+        marker_color='green',
+        opacity=0.7
+    ))
+    
+    # Middle: backlog_cleared (actually realized backlog allocation)
+    fig.add_trace(go.Bar(
+        x=plot_df['hour'],
+        y=backlog_cleared,
+        name='Backlog cleared (allocated & delivered)',
+        marker_color='yellow',
+        opacity=0.7,
+        base=Q_inv_base
+    ))
+    
+    # Top: Q_deficit (unmet reactive power, shown with pattern)
+    fig.add_trace(go.Bar(
+        x=plot_df['hour'],
+        y=plot_df['Q_deficit'],
+        name='Remaining deficit (carried forward)',
+        marker=dict(
+            color='red',
+            pattern=dict(shape='/', fillmode='overlay', solidity=0.5)
+        ),
+        opacity=0.6,
+        base=Q_inv_base + backlog_cleared
+    ))
+    
+    # Q_need_total as thin line overlay
+    Q_need_total = plot_df['Q_need_total'].values
+    fig.add_trace(go.Scatter(
+        x=plot_df['hour'],
+        y=Q_need_total,
+        name='Q_need (requested)',
+        mode='lines',
+        line=dict(color='darkgreen', width=1.5)
+    ))
+    
+    # A_alloc as dotted line for Day 2+ only
+    day2_plus_mask = plot_df['day_index'] > 0
+    if day2_plus_mask.any():
+        day2_plus_hours = plot_df.loc[day2_plus_mask, 'hour'].values
+        day2_plus_A_alloc = plot_df.loc[day2_plus_mask, 'A_alloc'].values
+        fig.add_trace(go.Scatter(
+            x=day2_plus_hours,
+            y=day2_plus_A_alloc,
+            name='A_alloc (planned, Day2+)',
+            mode='lines+markers',
+            line=dict(color='orange', width=2, dash='dot'),
+            marker=dict(size=4),
+            opacity=0.6
+        ))
+    
+    # Q_avail line (capacity limit)
+    fig.add_trace(go.Scatter(
+        x=plot_df['hour'],
+        y=plot_df['Q_avail'],
+        name='Q_avail',
+        mode='lines',
+        line=dict(color='blue', width=2, dash='dash')
+    ))
+    
+    # Q_limit line (EPDK / PF limit)
+    fig.add_trace(go.Scatter(
+        x=plot_df['hour'],
+        y=plot_df['Q_limit'],
+        name='Q_limit',
+        mode='lines',
+        line=dict(color='purple', width=2, dash='dot')
+    ))
+    
+    # Add vertical lines to separate days
+    horizon_days = plot_df['day_index'].max() + 1
+    for day_idx in range(1, horizon_days):
+        x_pos = day_idx * 24 - 0.5
+        fig.add_vline(
+            x=x_pos,
+            line_dash="dot",
+            line_color="gray",
+            opacity=0.5,
+            annotation_text=f"Day {day_idx} → Day {day_idx+1}",
+            annotation_position="top"
+        )
+    
+    # Highlight selected day if provided
+    if selected_day is not None and show_full_horizon:
+        day_start_hour = (selected_day - 1) * 24
+        day_end_hour = selected_day * 24
+        fig.add_vrect(
+            x0=day_start_hour - 0.5,
+            x1=day_end_hour - 0.5,
+            fillcolor="yellow",
+            opacity=0.1,
+            layer="below",
+            line_width=0,
+            annotation_text=f"Day {selected_day}",
+            annotation_position="top left"
+        )
+    
+    fig.update_layout(
+        barmode='stack',
+        xaxis_title=f'Hour (0..{plot_df["hour"].max()})',
+        yaxis_title='Q (MVAr)',
+        title=f'Multi-day reactive power operation with deficit carry-over{title_suffix}',
+        height=600,
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    
+    return fig
+
+
+def plot_input_timeseries(df_input, prices, selected_day=None, show_full_horizon=True, title_prefix="Input"):
+    """
+    Plot input time series (P_total, Q_total, P_PV_max, prices).
+    
+    Args:
+        df_input: DataFrame with columns: hour, P_total, Q_total, P_PV_max
+        prices: array of prices
+        selected_day: If provided and show_full_horizon=False, filter to this day
+        show_full_horizon: If True, plot all days
+        title_prefix: Prefix for plot title
+    
+    Returns:
+        fig: Plotly figure
+    """
+    # Filter to selected day if specified
+    if selected_day is not None and not show_full_horizon:
+        day_mask = (df_input['hour'] >= (selected_day - 1) * 24) & (df_input['hour'] < selected_day * 24)
+        plot_df = df_input[day_mask].copy()
+        plot_prices = prices[day_mask.values] if len(prices) == len(df_input) else prices
+        title_suffix = f" (Day {selected_day} only)"
+    else:
+        plot_df = df_input.copy()
+        plot_prices = prices if len(prices) == len(df_input) else np.tile(prices, (len(df_input) + len(prices) - 1) // len(prices))[:len(df_input)]
+        if selected_day is not None:
+            title_suffix = f" (Full horizon, Day {selected_day} highlighted)"
+        else:
+            title_suffix = " (Full horizon)"
+    
+    fig = go.Figure()
+    
+    # P_total
+    fig.add_trace(go.Scatter(
+        x=plot_df['hour'],
+        y=plot_df['P_total'],
+        name='P_total',
+        mode='lines+markers',
+        line=dict(color='blue', width=2),
+        marker=dict(size=4)
+    ))
+    
+    # Q_total
+    fig.add_trace(go.Scatter(
+        x=plot_df['hour'],
+        y=plot_df['Q_total'],
+        name='Q_total',
+        mode='lines+markers',
+        line=dict(color='red', width=2),
+        marker=dict(size=4)
+    ))
+    
+    # P_PV_max
+    fig.add_trace(go.Scatter(
+        x=plot_df['hour'],
+        y=plot_df['P_PV_max'],
+        name='P_PV_max',
+        mode='lines+markers',
+        line=dict(color='green', width=2),
+        marker=dict(size=4)
+    ))
+    
+    # Prices (on secondary axis - but we'll use same axis with different scale in subtitle)
+    # Actually, let's keep it on same axis but use a different color/style
+    fig.add_trace(go.Scatter(
+        x=plot_df['hour'],
+        y=plot_prices,
+        name='price (TL/MWh)',
+        mode='lines',
+        line=dict(color='orange', width=2, dash='dot'),
+        yaxis='y2'
+    ))
+    
+    # Highlight selected day if provided
+    if selected_day is not None and show_full_horizon:
+        day_start_hour = (selected_day - 1) * 24
+        day_end_hour = selected_day * 24
+        fig.add_vrect(
+            x0=day_start_hour - 0.5,
+            x1=day_end_hour - 0.5,
+            fillcolor="yellow",
+            opacity=0.1,
+            layer="below",
+            line_width=0
+        )
+    
+    # Add vertical lines to separate days
+    horizon_days = (plot_df['hour'].max() + 1) // 24
+    for day_idx in range(1, horizon_days):
+        x_pos = day_idx * 24 - 0.5
+        fig.add_vline(
+            x=x_pos,
+            line_dash="dot",
+            line_color="gray",
+            opacity=0.5
+        )
+    
+    fig.update_layout(
+        xaxis_title=f'Hour (0..{plot_df["hour"].max()})',
+        yaxis_title='P/Q/P_PV_max (MW/MVAr)',
+        yaxis2=dict(
+            title='Price (TL/MWh)',
+            overlaying='y',
+            side='right'
+        ),
+        title=f'{title_prefix} Time Series{title_suffix}',
+        height=500,
+        showlegend=True
+    )
+    
+    return fig
+
+
 # =========================================================
 # F) Main UI
 # =========================================================
@@ -1084,6 +1865,34 @@ penalty_rate_TL_per_MVArh = st.sidebar.number_input(
     help="If effective_reactive_price >= penalty_rate, buying is not economical"
 )
 
+# Horizon selection
+st.sidebar.header("Simulation Horizon")
+horizon_option = st.sidebar.selectbox(
+    "Horizon",
+    ["48h (current)", "7 days", "14 days", "30 days"],
+    index=0,
+    help="Select simulation horizon. 48h preserves existing behavior."
+)
+
+# Map horizon option to days
+horizon_map = {
+    "48h (current)": 2,
+    "7 days": 7,
+    "14 days": 14,
+    "30 days": 30
+}
+horizon_days = horizon_map[horizon_option]
+
+# Day selector for multi-day views
+day_to_view = None
+if horizon_days > 2:
+    day_to_view = st.sidebar.selectbox(
+        "Day Selector",
+        options=list(range(1, horizon_days + 1)),
+        index=0,
+        help="Select which day to inspect in detailed views"
+    )
+
 accumulate_backlog = st.sidebar.checkbox(
     "Accumulate backlog",
     value=st.session_state.accumulate_backlog,
@@ -1099,149 +1908,315 @@ if norwegian_file is None or ptf_file is None:
     st.info("Please upload both CSV files to begin.")
 else:
     try:
-        # Load files
-        df_case = load_case(norwegian_file)
-        prices = load_prices(ptf_file)
+        # =========================================================
+        # BRANCH: 48h (existing) OR multi-day path
+        # =========================================================
+        if horizon_days == 2:
+            # =========================================================
+            # EXISTING 48H PATH (UNCHANGED)
+            # =========================================================
+            # Load files
+            df_case = load_case(norwegian_file)
+            prices = load_prices(ptf_file)
+            
+            # Run simulation
+            results_df, Day1_backlog_total, Day2_backlog_total, reallocation_info, economic_info, diagnostics_info = simulate_two_days(
+                df_case, prices, S_rated, pf_limit, strategy, st.session_state.backlog_prev_total,
+                alpha=alpha, penalty_rate=penalty_rate_TL_per_MVArh
+            )
+            
+            # Update persistent backlog
+            if accumulate_backlog:
+                st.session_state.backlog_prev_total += Day2_backlog_total
+            else:
+                st.session_state.backlog_prev_total = Day2_backlog_total
+            
+            # Display metrics
+            st.info("""
+            **Market Interaction Logic:**
+            - **Day 1:** The system requests Q_need from the market. The market delivers Q_inv (limited by Q_avail). 
+              Any unmet part becomes Q_deficit and is carried forward.
+            - **Day 2:** The system requests Q_need_total = Q_need_day2 (Day2 own need) + A_alloc (Day1 deficit allocation).
+              The market delivers Q_inv (limited by Q_avail). Any unmet part becomes Q_deficit (carried to Day3/backlog).
+            """)
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Day 1 Q_deficit Total", f"{Day1_backlog_total:.3f} MVArh", 
+                         help="Sum of Q_deficit from Day 1 (becomes backlog for Day 2)")
+            with col2:
+                st.metric("Day 2 Q_deficit Total", f"{Day2_backlog_total:.3f} MVArh",
+                         help="Sum of Q_deficit from Day 2")
+            with col3:
+                st.metric("Persistent Q_deficit (next run)", f"{st.session_state.backlog_prev_total:.3f} MVArh",
+                         help="Q_deficit carried to next simulation run")
+            
+            # Display main results table
+            st.header("Main Results Table (48 hours)")
+            display_df = results_df.copy()
+            display_df = display_df.round(4)
+            st.dataframe(display_df, use_container_width=True)
+            
+            # Debug expander for Q_avail verification
+            with st.expander("🔍 Debug: Q_avail Calculation Verification"):
+                st.caption("Verify that Q_avail = S_rated/2 when P_PV_max = 0 (night hours)")
+                debug_df = results_df[['hour', 'day_index', 'hour_in_day', 'P_PV_max', 'Q_avail']].copy()
+                debug_df['S_rated'] = S_rated
+                debug_df['Expected_Q_avail_night'] = np.where(debug_df['P_PV_max'] == 0, S_rated / 2.0, 
+                                                              np.sqrt(np.maximum(S_rated**2 - debug_df['P_PV_max']**2, 0)))
+                debug_df = debug_df.round(4)
+                st.dataframe(debug_df, use_container_width=True)
+                
+                # Sanity check
+                night_mask = debug_df['P_PV_max'] == 0
+                if night_mask.any():
+                    night_q_avail = debug_df.loc[night_mask, 'Q_avail'].values
+                    expected_night = S_rated / 2.0
+                    if np.any(np.abs(night_q_avail - expected_night) > 1e-3):
+                        st.warning(f"⚠️ Some night hours have Q_avail ≠ S_rated/2. Expected: {expected_night:.3f}")
+                    else:
+                        st.success(f"✅ Night hours (P_PV_max=0) correctly show Q_avail = {expected_night:.3f} MVAr")
+            
+            # Plots
+            st.header("Visualizations")
+            
+            # 48-hour timeline visualization
+            st.subheader("48-hour Reactive Power Operation Timeline")
+            fig_48h = plot_48hour_timeline(results_df)
+            st.plotly_chart(fig_48h, use_container_width=True)
+            
+            # Day 2 Diagnostics Table
+            st.subheader("Day 2 Diagnostics Table")
+            st.caption("Verification table showing capacity-aware backlog allocation. Includes freecap, A_alloc_raw, and final allocation.")
+            
+            # Build diagnostics table from diagnostics_info
+            diagnostics_df = pd.DataFrame({
+                'hour_in_day': diagnostics_info['hour_in_day'],
+                'price': diagnostics_info['price'],
+                'Q_avail': diagnostics_info['Q_avail'],
+                'base_Q_need': diagnostics_info['base_Q_need'],
+                'freecap': diagnostics_info['freecap'],
+                'A_alloc_raw': diagnostics_info['A_alloc_raw'],
+                'A_alloc': diagnostics_info['A_alloc'],
+                'Q_need_final': diagnostics_info['Q_need_final'],
+                'Q_inv': diagnostics_info['Q_inv'],
+                'Q_deficit': diagnostics_info['Q_deficit']
+            })
+            
+            # Add economic columns if using economic strategy
+            if strategy == "economic_feasible" and economic_info:
+                diagnostics_df['effective_reactive_price'] = economic_info['effective_reactive_price']
+                diagnostics_df['penalty_rate'] = economic_info['penalty_rate']
+                diagnostics_df['eligible'] = economic_info['eligible'].astype(int)  # Convert bool to int for display
+                
+                # Reorder columns
+                diagnostics_df = diagnostics_df[['hour_in_day', 'price', 'effective_reactive_price', 'penalty_rate', 
+                                                 'eligible', 'Q_avail', 'base_Q_need', 'freecap', 
+                                                 'A_alloc_raw', 'A_alloc', 'Q_need_final', 'Q_inv', 'Q_deficit']]
+            
+            diagnostics_df = diagnostics_df.round(4)
+            st.dataframe(diagnostics_df, use_container_width=True)
+            
+            # Show leftover unallocated if any
+            leftover = diagnostics_info['leftover_unallocated']
+            if leftover > 1e-6:
+                st.info(f"ℹ️ **Leftover unallocated backlog:** {leftover:.4f} MVArh (could not be allocated due to capacity constraints)")
+            
+            # Show economic summary if using economic strategy
+            if strategy == "economic_feasible" and economic_info:
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Total Allocated", f"{economic_info['allocated_total']:.3f} MVArh",
+                             help="Amount of Day1 backlog allocated to Day2")
+                with col2:
+                    st.metric("Remaining Unallocated", f"{economic_info['remaining_unallocated']:.3f} MVArh",
+                             help="Intentionally left as deficit (buying not economical or no capacity)")
+            
+            # Strategy 3 reallocation table (technical details, internal use)
+            if strategy == "price_feasible" and reallocation_info:
+                st.subheader("Strategy 3: Technical Reallocation Details (Internal)")
+                st.caption("This table shows technical details of how backlog allocation was adjusted to respect Q_avail limits.")
+                realloc_df = pd.DataFrame({
+                    'hour_in_day': reallocation_info['day2_hours'],
+                    'price': reallocation_info['prices_day2'],
+                    'Q_need_base': reallocation_info['Q_need_base_day2'],
+                    'Q_need_final': reallocation_info['Q_need_day2'],
+                    'Q_avail': reallocation_info['Q_avail_day2'],
+                    'A_initial': reallocation_info['A_initial'],
+                    'A_final': reallocation_info['A_final'],
+                    'reallocated_amount': reallocation_info['reallocated_amount']
+                })
+                realloc_df = realloc_df.round(4)
+                st.dataframe(realloc_df, use_container_width=True)
+            
+            # Download button
+            st.header("Download Results")
+            csv = results_df.to_csv(index=False)
+            st.download_button(
+                label="Download Results as CSV",
+                data=csv,
+                file_name="reactive_power_results.csv",
+                mime="text/csv"
+            )
         
-        # Run simulation
-        results_df, Day1_backlog_total, Day2_backlog_total, reallocation_info, economic_info, diagnostics_info = simulate_two_days(
-            df_case, prices, S_rated, pf_limit, strategy, st.session_state.backlog_prev_total,
-            alpha=alpha, penalty_rate=penalty_rate_TL_per_MVArh
-        )
-        
-        # Update persistent backlog
-        if accumulate_backlog:
-            st.session_state.backlog_prev_total += Day2_backlog_total
         else:
-            st.session_state.backlog_prev_total = Day2_backlog_total
-        
-        # Display metrics
-        st.info("""
-        **Market Interaction Logic:**
-        - **Day 1:** The system requests Q_need from the market. The market delivers Q_inv (limited by Q_avail). 
-          Any unmet part becomes Q_deficit and is carried forward.
-        - **Day 2:** The system requests Q_need_total = Q_need_day2 (Day2 own need) + A_alloc (Day1 deficit allocation).
-          The market delivers Q_inv (limited by Q_avail). Any unmet part becomes Q_deficit (carried to Day3/backlog).
-        """)
-        
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Day 1 Q_deficit Total", f"{Day1_backlog_total:.3f} MVArh", 
-                     help="Sum of Q_deficit from Day 1 (becomes backlog for Day 2)")
-        with col2:
-            st.metric("Day 2 Q_deficit Total", f"{Day2_backlog_total:.3f} MVArh",
-                     help="Sum of Q_deficit from Day 2")
-        with col3:
-            st.metric("Persistent Q_deficit (next run)", f"{st.session_state.backlog_prev_total:.3f} MVArh",
-                     help="Q_deficit carried to next simulation run")
-        
-        # Display main results table
-        st.header("Main Results Table (48 hours)")
-        display_df = results_df.copy()
-        display_df = display_df.round(4)
-        st.dataframe(display_df, use_container_width=True)
-        
-        # Debug expander for Q_avail verification
-        with st.expander("🔍 Debug: Q_avail Calculation Verification"):
-            st.caption("Verify that Q_avail = S_rated/2 when P_PV_max = 0 (night hours)")
-            debug_df = results_df[['hour', 'day_index', 'hour_in_day', 'P_PV_max', 'Q_avail']].copy()
-            debug_df['S_rated'] = S_rated
-            debug_df['Expected_Q_avail_night'] = np.where(debug_df['P_PV_max'] == 0, S_rated / 2.0, 
-                                                          np.sqrt(np.maximum(S_rated**2 - debug_df['P_PV_max']**2, 0)))
-            debug_df = debug_df.round(4)
-            st.dataframe(debug_df, use_container_width=True)
+            # =========================================================
+            # MULTI-DAY PATH (7/14/30 days)
+            # =========================================================
+            # Load files for multi-day
+            df_case_N = load_case_multiday(norwegian_file, horizon_days)
+            prices_N = load_prices_multiday(ptf_file, horizon_days)
             
-            # Sanity check
-            night_mask = debug_df['P_PV_max'] == 0
-            if night_mask.any():
-                night_q_avail = debug_df.loc[night_mask, 'Q_avail'].values
-                expected_night = S_rated / 2.0
-                if np.any(np.abs(night_q_avail - expected_night) > 1e-3):
-                    st.warning(f"⚠️ Some night hours have Q_avail ≠ S_rated/2. Expected: {expected_night:.3f}")
+            # Run multi-day simulation
+            results_df_N, daily_summary_df, cohort_df = simulate_multi_days(
+                df_case_N, prices_N, S_rated, pf_limit, strategy, st.session_state.backlog_prev_total,
+                alpha=alpha, penalty_rate=penalty_rate_TL_per_MVArh
+            )
+            
+            # Update persistent backlog (use last day's backlog_out)
+            last_day_backlog = daily_summary_df.iloc[-1]['backlog_out'] if len(daily_summary_df) > 0 else 0.0
+            if accumulate_backlog:
+                st.session_state.backlog_prev_total += last_day_backlog
+            else:
+                st.session_state.backlog_prev_total = last_day_backlog
+            
+            # Display metrics
+            st.info(f"""
+            **Multi-Day Simulation ({horizon_days} days):**
+            - Each day computes base Q_need from PF rule, allocates previous day's backlog, delivers Q_inv, and tracks deficit.
+            - Backlog is allocated using the selected strategy (uniform/price_weighted/price_feasible/economic_feasible).
+            - Deficit is carried forward day-by-day using the same logic as the 48h simulation.
+            """)
+            
+            # Display daily summary table
+            st.header("Daily Summary Table")
+            st.caption("Summary of backlog flow and delivery for each day")
+            display_summary = daily_summary_df.copy()
+            display_summary = display_summary.round(4)
+            st.dataframe(display_summary, use_container_width=True)
+            
+            # Day 8 deficit KPI (when horizon >= 7)
+            if horizon_days >= 7:
+                st.header("Day 8 Deficit Metrics")
+                day7_backlog = daily_summary_df.iloc[6]['backlog_out'] if len(daily_summary_df) > 6 else 0.0
+                st.metric(
+                    "Deficit carried into Day 8",
+                    f"{day7_backlog:.3f} MVArh",
+                    help="Sum of Q_deficit from Day 7 (backlog at end of Day 7)"
+                )
+                
+                # Cohort breakdown table
+                if cohort_df is not None and len(cohort_df) > 0:
+                    st.subheader("Deficit Cohort Breakdown (at end of Day 7)")
+                    st.caption("How much deficit from each origin day (Day 1-7) is still not covered at Day 8. Uses FIFO clearing rule.")
+                    display_cohort = cohort_df.copy()
+                    display_cohort = display_cohort.round(4)
+                    # Sort by origin_day
+                    display_cohort = display_cohort.sort_values('origin_day')
+                    st.dataframe(display_cohort, use_container_width=True)
+                    
+                    # Show Day 1 remaining if present
+                    day1_remaining = cohort_df[cohort_df['origin_day'] == 1]['remaining_amount'].values
+                    if len(day1_remaining) > 0 and day1_remaining[0] > 1e-6:
+                        st.metric(
+                            "Uncovered deficit from Day 1 still remaining at Day 8",
+                            f"{day1_remaining[0]:.3f} MVArh",
+                            help="Portion of Day 1 deficit that was not cleared by the end of Day 7"
+                        )
                 else:
-                    st.success(f"✅ Night hours (P_PV_max=0) correctly show Q_avail = {expected_night:.3f} MVAr")
-        
-        # Plots
-        st.header("Visualizations")
-        
-        # 48-hour timeline visualization
-        st.subheader("48-hour Reactive Power Operation Timeline")
-        fig_48h = plot_48hour_timeline(results_df)
-        st.plotly_chart(fig_48h, use_container_width=True)
-        
-        # Day 2 Diagnostics Table
-        st.subheader("Day 2 Diagnostics Table")
-        st.caption("Verification table showing capacity-aware backlog allocation. Includes freecap, A_alloc_raw, and final allocation.")
-        
-        # Build diagnostics table from diagnostics_info
-        diagnostics_df = pd.DataFrame({
-            'hour_in_day': diagnostics_info['hour_in_day'],
-            'price': diagnostics_info['price'],
-            'Q_avail': diagnostics_info['Q_avail'],
-            'base_Q_need': diagnostics_info['base_Q_need'],
-            'freecap': diagnostics_info['freecap'],
-            'A_alloc_raw': diagnostics_info['A_alloc_raw'],
-            'A_alloc': diagnostics_info['A_alloc'],
-            'Q_need_final': diagnostics_info['Q_need_final'],
-            'Q_inv': diagnostics_info['Q_inv'],
-            'Q_deficit': diagnostics_info['Q_deficit']
-        })
-        
-        # Add economic columns if using economic strategy
-        if strategy == "economic_feasible" and economic_info:
-            diagnostics_df['effective_reactive_price'] = economic_info['effective_reactive_price']
-            diagnostics_df['penalty_rate'] = economic_info['penalty_rate']
-            diagnostics_df['eligible'] = economic_info['eligible'].astype(int)  # Convert bool to int for display
+                    st.success("✅ All deficit from Days 1-7 was cleared by the end of Day 7!")
             
-            # Reorder columns
-            diagnostics_df = diagnostics_df[['hour_in_day', 'price', 'effective_reactive_price', 'penalty_rate', 
-                                             'eligible', 'Q_avail', 'base_Q_need', 'freecap', 
-                                             'A_alloc_raw', 'A_alloc', 'Q_need_final', 'Q_inv', 'Q_deficit']]
-        
-        diagnostics_df = diagnostics_df.round(4)
-        st.dataframe(diagnostics_df, use_container_width=True)
-        
-        # Show leftover unallocated if any
-        leftover = diagnostics_info['leftover_unallocated']
-        if leftover > 1e-6:
-            st.info(f"ℹ️ **Leftover unallocated backlog:** {leftover:.4f} MVArh (could not be allocated due to capacity constraints)")
-        
-        # Show economic summary if using economic strategy
-        if strategy == "economic_feasible" and economic_info:
+            # Input visualization section
+            st.header("Input Visualization")
+            
+            # Toggle for showing selected day only
+            show_day_only = st.checkbox(
+                f"Show only Day {day_to_view}" if day_to_view else "Show selected day only",
+                value=False,
+                key="show_day_only_input"
+            )
+            
+            # Input time series plot
+            st.subheader("Scenario Inputs and PTF Prices")
+            fig_input = plot_input_timeseries(
+                df_case_N[['hour', 'P_total', 'Q_total', 'P_PV_max']],
+                prices_N,
+                selected_day=day_to_view,
+                show_full_horizon=not show_day_only,
+                title_prefix="Input"
+            )
+            st.plotly_chart(fig_input, use_container_width=True)
+            
+            # Input tables
             col1, col2 = st.columns(2)
             with col1:
-                st.metric("Total Allocated", f"{economic_info['allocated_total']:.3f} MVArh",
-                         help="Amount of Day1 backlog allocated to Day2")
+                st.subheader("Scenario Inputs Table")
+                input_df = df_case_N[['hour', 'P_total', 'Q_total', 'P_PV_max']].copy()
+                if show_day_only and day_to_view:
+                    day_mask = (input_df['hour'] >= (day_to_view - 1) * 24) & (input_df['hour'] < day_to_view * 24)
+                    input_df = input_df[day_mask]
+                input_df = input_df.round(4)
+                st.dataframe(input_df, use_container_width=True, height=400)
+            
             with col2:
-                st.metric("Remaining Unallocated", f"{economic_info['remaining_unallocated']:.3f} MVArh",
-                         help="Intentionally left as deficit (buying not economical or no capacity)")
-        
-        # Strategy 3 reallocation table (technical details, internal use)
-        if strategy == "price_feasible" and reallocation_info:
-            st.subheader("Strategy 3: Technical Reallocation Details (Internal)")
-            st.caption("This table shows technical details of how backlog allocation was adjusted to respect Q_avail limits.")
-            realloc_df = pd.DataFrame({
-                'hour_in_day': reallocation_info['day2_hours'],
-                'price': reallocation_info['prices_day2'],
-                'Q_need_base': reallocation_info['Q_need_base_day2'],
-                'Q_need_final': reallocation_info['Q_need_day2'],
-                'Q_avail': reallocation_info['Q_avail_day2'],
-                'A_initial': reallocation_info['A_initial'],
-                'A_final': reallocation_info['A_final'],
-                'reallocated_amount': reallocation_info['reallocated_amount']
-            })
-            realloc_df = realloc_df.round(4)
-            st.dataframe(realloc_df, use_container_width=True)
-        
-        # Download button
-        st.header("Download Results")
-        csv = results_df.to_csv(index=False)
-        st.download_button(
-            label="Download Results as CSV",
-            data=csv,
-            file_name="reactive_power_results.csv",
-            mime="text/csv"
-        )
+                st.subheader("PTF Prices Table")
+                prices_df = pd.DataFrame({
+                    'hour': np.arange(len(prices_N)),
+                    'price': prices_N
+                })
+                if show_day_only and day_to_view:
+                    day_mask = (prices_df['hour'] >= (day_to_view - 1) * 24) & (prices_df['hour'] < day_to_view * 24)
+                    prices_df = prices_df[day_mask]
+                prices_df = prices_df.round(4)
+                st.dataframe(prices_df, use_container_width=True, height=400)
+            
+            # Output visualization section
+            st.header("Output Visualization")
+            
+            # Toggle for showing selected day only
+            show_day_only_output = st.checkbox(
+                f"Show only Day {day_to_view}" if day_to_view else "Show selected day only",
+                value=False,
+                key="show_day_only_output"
+            )
+            
+            # Multi-day timeline plot
+            st.subheader("Multi-Day Reactive Power Operation Timeline")
+            fig_multiday = plot_multi_day_timeline(
+                results_df_N,
+                selected_day=day_to_view,
+                show_full_horizon=not show_day_only_output
+            )
+            st.plotly_chart(fig_multiday, use_container_width=True)
+            
+            # Results table (optional: filter by selected day)
+            st.subheader("Detailed Results Table")
+            display_results = results_df_N.copy()
+            if show_day_only_output and day_to_view:
+                day_mask = (display_results['day_index'] == (day_to_view - 1))
+                display_results = display_results[day_mask]
+            # Remove internal columns if any
+            display_results = display_results.round(4)
+            st.dataframe(display_results, use_container_width=True, height=400)
+            
+            # Download button
+            st.header("Download Results")
+            csv = results_df_N.to_csv(index=False)
+            st.download_button(
+                label="Download Multi-Day Results as CSV",
+                data=csv,
+                file_name=f"reactive_power_results_{horizon_days}days.csv",
+                mime="text/csv"
+            )
+            
+            # Download daily summary
+            csv_summary = daily_summary_df.to_csv(index=False)
+            st.download_button(
+                label="Download Daily Summary as CSV",
+                data=csv_summary,
+                file_name=f"daily_summary_{horizon_days}days.csv",
+                mime="text/csv"
+            )
         
     except Exception as e:
         st.error(f"Error: {str(e)}")
